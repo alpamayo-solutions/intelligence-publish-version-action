@@ -1,0 +1,229 @@
+name: Publish Alpamayo Intelligence version
+description: Publish a resource version and optional artifacts into Alpamayo Intelligence.
+
+inputs:
+  api-url:
+    description: Base URL of the Alpamayo Intelligence API, for example https://intelligence.alpamayo-solutions.com.
+    required: true
+  token:
+    description: Alpamayo Intelligence service-account token.
+    required: false
+    default: ''
+  client-id:
+    description: Optional Keycloak client ID used to mint a token when token is not provided.
+    required: false
+    default: ''
+  client-secret:
+    description: Optional Keycloak client secret used to mint a token when token is not provided.
+    required: false
+    default: ''
+  token-url:
+    description: Optional explicit Keycloak token URL.
+    required: false
+    default: ''
+  keycloak-url:
+    description: Optional Keycloak base URL used with realm to build the token URL.
+    required: false
+    default: ''
+  realm:
+    description: Keycloak realm used when keycloak-url or api-url/auth is used for token minting.
+    required: false
+    default: intelligence
+  project-id:
+    description: Project ID that owns the resource.
+    required: true
+  resource-id:
+    description: ProjectResource ID receiving the version observation.
+    required: true
+  version:
+    description: Version label to publish.
+    required: true
+  source-ref-kind:
+    description: Source reference kind, such as git_tag, git_branch, git_commit, or external.
+    required: false
+    default: git_tag
+  source-ref:
+    description: Source reference that produced the version.
+    required: false
+    default: ''
+  resolved-ref:
+    description: Immutable resolved reference, usually a full commit SHA.
+    required: false
+    default: ''
+  artifact-kind:
+    description: Artifact kind to attach when artifact-file or artifact-url is set.
+    required: false
+    default: sbom
+  artifact-file:
+    description: Local artifact file path to upload.
+    required: false
+    default: ''
+  artifact-files:
+    description: Newline-separated local artifact file paths or glob patterns to upload.
+    required: false
+    default: ''
+  artifact-url:
+    description: External artifact URL to attach instead of uploading a file.
+    required: false
+    default: ''
+  artifact-label:
+    description: Human readable artifact label.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Publish version
+      shell: bash
+      env:
+        ALP_API_URL: ${{ inputs.api-url }}
+        ALP_TOKEN: ${{ inputs.token }}
+        ALP_CLIENT_ID: ${{ inputs.client-id }}
+        ALP_CLIENT_SECRET: ${{ inputs.client-secret }}
+        ALP_TOKEN_URL: ${{ inputs.token-url }}
+        ALP_KEYCLOAK_URL: ${{ inputs.keycloak-url }}
+        ALP_REALM: ${{ inputs.realm }}
+        ALP_PROJECT_ID: ${{ inputs.project-id }}
+        ALP_RESOURCE_ID: ${{ inputs.resource-id }}
+        ALP_VERSION: ${{ inputs.version }}
+        ALP_SOURCE_REF_KIND: ${{ inputs.source-ref-kind }}
+        ALP_SOURCE_REF: ${{ inputs.source-ref }}
+        ALP_RESOLVED_REF: ${{ inputs.resolved-ref }}
+        ALP_ARTIFACT_KIND: ${{ inputs.artifact-kind }}
+        ALP_ARTIFACT_FILE: ${{ inputs.artifact-file }}
+        ALP_ARTIFACT_FILES: ${{ inputs.artifact-files }}
+        ALP_ARTIFACT_URL: ${{ inputs.artifact-url }}
+        ALP_ARTIFACT_LABEL: ${{ inputs.artifact-label }}
+      run: |
+        set -euo pipefail
+        api_url="${ALP_API_URL%/}"
+        version_url="${api_url}/api/v1/projects/${ALP_PROJECT_ID}/resources/${ALP_RESOURCE_ID}/tracked-versions/"
+        artifact_url="${api_url}/api/v1/projects/${ALP_PROJECT_ID}/resources/${ALP_RESOURCE_ID}/tracked-version-artifacts/"
+
+        sha256_file() {
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$1" | awk '{print $1}'
+            return
+          fi
+          shasum -a 256 "$1" | awk '{print $1}'
+        }
+
+        mint_token() {
+          if [[ -z "${ALP_CLIENT_ID}" || -z "${ALP_CLIENT_SECRET}" ]]; then
+            echo "::error::Provide token or client-id/client-secret for Intelligence publishing"
+            exit 2
+          fi
+
+          local token_url response http_code body
+          token_url="${ALP_TOKEN_URL:-${ALP_KEYCLOAK_URL:-${api_url}/auth}/realms/${ALP_REALM}/protocol/openid-connect/token}"
+          response="$(
+            curl -sS -X POST "${token_url}" \
+              -A "Alpamayo-Intelligence-Publish-Version/1.0" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "grant_type=client_credentials" \
+              --data-urlencode "client_id=${ALP_CLIENT_ID}" \
+              --data-urlencode "client_secret=${ALP_CLIENT_SECRET}" \
+              -w '\n%{http_code}'
+          )"
+          http_code="$(printf '%s\n' "${response}" | tail -n 1)"
+          body="$(printf '%s\n' "${response}" | sed '$d')"
+          if [[ "${http_code:-0}" -lt 200 || "${http_code}" -ge 300 ]]; then
+            echo "::error::Failed to mint Intelligence token (${http_code})"
+            exit 1
+          fi
+          TOKEN_BODY="${body}" python3 - <<'PY'
+        import json
+        import os
+
+        print(json.loads(os.environ["TOKEN_BODY"])["access_token"])
+        PY
+        }
+
+        expand_artifact_files() {
+          shopt -s nullglob
+          local pattern
+          local -a matches
+          if [[ -n "${ALP_ARTIFACT_FILE}" ]]; then
+            printf '%s\n' "${ALP_ARTIFACT_FILE}"
+          fi
+          while IFS= read -r pattern; do
+            [[ -n "${pattern}" ]] || continue
+            matches=( ${pattern} )
+            if [[ "${#matches[@]}" -eq 0 ]]; then
+              echo "::warning::No artifact files matched '${pattern}'" >&2
+              continue
+            fi
+            printf '%s\n' "${matches[@]}"
+          done <<< "${ALP_ARTIFACT_FILES}"
+        }
+
+        upload_file_artifact() {
+          local artifact_file="$1"
+          local base sha label external_id
+          base="$(basename "${artifact_file}")"
+          sha="$(sha256_file "${artifact_file}")"
+          label="${ALP_ARTIFACT_LABEL:-${base}}"
+          external_id="github:${ALP_RESOURCE_ID}:version:${ALP_VERSION}:${ALP_ARTIFACT_KIND}:${base}:${sha}"
+
+          curl_args=(
+            -fsS -X POST "${artifact_url}"
+            -H "Authorization: Bearer ${ALP_TOKEN}"
+            -H "X-Alp-Channel: ci"
+            -F "version_label=${ALP_VERSION}"
+            -F "source_system=github"
+            -F "channel=ci"
+            -F "source_ref_kind=${ALP_SOURCE_REF_KIND}"
+            -F "source_ref=${ALP_SOURCE_REF}"
+            -F "resolved_ref=${ALP_RESOLVED_REF}"
+            -F "kind=${ALP_ARTIFACT_KIND}"
+            -F "label=${label}"
+            -F "external_id=${external_id}"
+          )
+          curl_args+=(-F "file=@${artifact_file}")
+          curl "${curl_args[@]}"
+        }
+
+        if [[ -z "${ALP_TOKEN}" ]]; then
+          ALP_TOKEN="$(mint_token)"
+        fi
+        echo "::add-mask::${ALP_TOKEN}"
+        [[ -n "${ALP_CLIENT_SECRET}" ]] && echo "::add-mask::${ALP_CLIENT_SECRET}"
+
+        mapfile -t artifact_files < <(expand_artifact_files)
+        if [[ "${#artifact_files[@]}" -gt 0 ]]; then
+          for artifact_file in "${artifact_files[@]}"; do
+            upload_file_artifact "${artifact_file}"
+          done
+          exit 0
+        fi
+
+        if [[ -n "${ALP_ARTIFACT_URL}" ]]; then
+          curl -fsS -X POST "${artifact_url}" \
+            -H "Authorization: Bearer ${ALP_TOKEN}" \
+            -H "X-Alp-Channel: ci" \
+            -F "version_label=${ALP_VERSION}" \
+            -F "source_system=github" \
+            -F "channel=ci" \
+            -F "source_ref_kind=${ALP_SOURCE_REF_KIND}" \
+            -F "source_ref=${ALP_SOURCE_REF}" \
+            -F "resolved_ref=${ALP_RESOLVED_REF}" \
+            -F "kind=${ALP_ARTIFACT_KIND}" \
+            -F "label=${ALP_ARTIFACT_LABEL}" \
+            -F "url=${ALP_ARTIFACT_URL}"
+          exit 0
+        fi
+
+        payload="$(python3 -c 'import json, os; print(json.dumps({
+            "label": os.environ["ALP_VERSION"],
+            "source_system": "github",
+            "channel": "ci",
+            "source_ref_kind": os.environ.get("ALP_SOURCE_REF_KIND", ""),
+            "source_ref": os.environ.get("ALP_SOURCE_REF", ""),
+            "resolved_ref": os.environ.get("ALP_RESOLVED_REF", ""),
+        }))')"
+        curl -fsS -X POST "${version_url}" \
+          -H "Authorization: Bearer ${ALP_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -H "X-Alp-Channel: ci" \
+          --data "${payload}"
