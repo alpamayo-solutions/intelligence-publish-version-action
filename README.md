@@ -1,78 +1,73 @@
 # Alpamayo Intelligence Publish Version Action
 
-Public GitHub Action for publishing repository release/build versions to
+Public GitHub Action for publishing component versions (and SBOM/artifacts) to
 Alpamayo Intelligence.
 
-The action records a version for an Intelligence project resource and can attach
-local artifact files, such as CycloneDX SBOMs, as version artifacts. It is a
-thin wrapper around the Intelligence ingest API; repository-specific behavior
-belongs in the caller workflow.
+The action publishes a version to an Intelligence **component feed** and uploads
+local artifact files (such as CycloneDX SBOMs) as version artifacts. It is a thin
+wrapper around the Intelligence publish + artifact-upload API; repository-specific
+behavior belongs in the caller workflow.
 
 ## Usage
 
 ```yaml
 - name: Publish version to Alpamayo Intelligence
-  uses: alpamayo-solutions/intelligence-publish-version-action@v1
+  uses: alpamayo-solutions/intelligence-publish-version-action@v2
   with:
     api-url: https://intelligence.alpamayo-solutions.com
-    client-id: intelligence-version-publisher
-    client-secret: ${{ secrets.INTELLIGENCE_VERSION_PUBLISHER_CLIENT_SECRET }}
+    token: ${{ steps.intelligence-token.outputs.publisher-token }}  # <token_key>.<secret>
     project-id: 01KMTEFDGRY87RPNHPBCN5FAVN
-    resource-id: 01KMWCTX9WQYA63M53PQ0TX5ZA
+    feed: 01KSZK7J7HNYY6ZNJ901XDMBW3
     version: ${{ steps.meta.outputs.version }}
-    source-ref-kind: git_branch
-    source-ref: ${{ github.ref_name }}
-    resolved-ref: ${{ github.sha }}
+    external-ref: ${{ github.ref_name }}
+    commit-sha: ${{ github.sha }}
     artifact-files: sboms/*.cdx.json
 ```
 
+## Authentication
+
+Authenticate with a **publisher token** created via
+`alp admin versioning publisher-token-create` (format `<token_key>.<secret>`),
+passed as `token` and sent as a Bearer credential. The publisher is resolved from
+the token, and must be allowlisted for the target `feed`. Store the token in a
+secret source (a GitHub Actions secret or a preceding `op read` step) — do not use
+platform-admin credentials.
+
 ## Inputs
 
-Required inputs:
+Required:
 
 | Input | Description |
 | --- | --- |
 | `api-url` | Base URL of the Intelligence API. |
-| `project-id` | Intelligence project ID that owns the resource. |
-| `resource-id` | Intelligence project resource receiving the version. |
+| `token` | Publisher token `<token_key>.<secret>`. |
+| `project-id` | Project ID that owns the component (used to upload artifacts). |
+| `feed` | VersionFeed ID to publish to (the publisher must be allowlisted for it). |
 | `version` | Version label to publish. |
 
-Authentication inputs:
-
-| Input | Description |
-| --- | --- |
-| `token` | Existing Intelligence access token. |
-| `client-id` | Keycloak service-account client ID used when `token` is not provided. |
-| `client-secret` | Keycloak service-account client secret used when `token` is not provided. |
-| `token-url` | Explicit Keycloak token URL. |
-| `keycloak-url` | Keycloak base URL used with `realm` to build a token URL. |
-| `realm` | Keycloak realm, default `intelligence`. |
-
-Version metadata inputs:
+Version metadata (optional):
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `source-ref-kind` | `git_tag` | Source reference kind, such as `git_tag`, `git_branch`, `git_commit`, or `external`. |
-| `source-ref` | | Source reference that produced the version. |
-| `resolved-ref` | | Immutable resolved reference, usually a full commit SHA. |
+| `origin-external-id` | (version) | Stable external identity for the version. |
+| `source-kind` | `git` | `git`, `object`, or `observed`. |
+| `external-ref` | | Source reference, such as a tag or branch. |
+| `commit-sha` | | Resolved immutable commit SHA. |
+| `object-key` | | Object-storage key for object-kind primary content. |
 
-Artifact inputs:
+Artifacts (optional):
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `artifact-kind` | `sbom` | Artifact kind recorded in Intelligence. |
+| `artifact-kind` | `sbom` | Kind recorded for uploaded artifact files. |
 | `artifact-file` | | One local artifact file to upload. |
-| `artifact-files` | | Newline-separated local artifact paths or glob patterns to upload. |
-| `artifact-url` | | External artifact URL to record instead of uploading a local file. |
-| `artifact-label` | | Human-readable artifact label. Local uploads default to the file basename. |
+| `artifact-files` | | Newline-separated local paths or glob patterns to upload. |
+| `artifact-label` | | Human-readable artifact label. |
 
-## Requirements
+## Migrating from v1
 
-The calling workflow needs:
-
-- A registered Intelligence project resource for the repository or deployable.
-- A scoped service account allowed to write tracked versions for that resource.
-- A secret source for the service-account credential, such as GitHub Actions
-  secrets or a preceding `op read` step.
-
-Do not use platform-admin service accounts for CI version publishing.
+v1 posted to the removed resource-scoped `tracked-version` routes and authenticated
+with a Keycloak service account. v2 publishes to `/admin/versioning/publish/` with a
+publisher token and uploads artifacts to
+`/projects/<project-id>/versions/<version-id>/artifacts/upload/`. Replace
+`client-id`/`client-secret`/`resource-id` with `token` + `feed`.
