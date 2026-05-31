@@ -1,0 +1,107 @@
+parameters:
+  - name: apiUrl
+    type: string
+  - name: token
+    type: string
+  - name: projectId
+    type: string
+  - name: feed
+    type: string
+  - name: version
+    type: string
+  - name: originExternalId
+    type: string
+    default: ''
+  - name: sourceKind
+    type: string
+    default: git
+  - name: externalRef
+    type: string
+    default: ''
+  - name: commitSha
+    type: string
+    default: ''
+  - name: objectKey
+    type: string
+    default: ''
+  - name: artifactKind
+    type: string
+    default: sbom
+  - name: artifactFile
+    type: string
+    default: ''
+  - name: artifactFiles
+    type: string
+    default: ''
+  - name: artifactLabel
+    type: string
+    default: ''
+
+steps:
+  - bash: |
+      set -euo pipefail
+      echo "##vso[task.setsecret]${ALP_TOKEN}"
+      api_url="${ALP_API_URL%/}"
+
+      # 1. Publish the version. The publisher is resolved from the token, not the body.
+      payload="$(python3 -c '
+      import json, os
+      print(json.dumps({
+          "feed": os.environ["ALP_FEED"],
+          "label": os.environ["ALP_VERSION"],
+          "origin_external_id": os.environ.get("ALP_ORIGIN_EXTERNAL_ID") or os.environ["ALP_VERSION"],
+          "source_kind": os.environ.get("ALP_SOURCE_KIND", "git"),
+          "external_ref": os.environ.get("ALP_EXTERNAL_REF", ""),
+          "commit_sha": os.environ.get("ALP_COMMIT_SHA", ""),
+          "object_key": os.environ.get("ALP_OBJECT_KEY", ""),
+      }))')"
+      version_id="$(
+        curl -fsS -X POST "${api_url}/api/v1/admin/versioning/publish/" \
+          -H "Authorization: Bearer ${ALP_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data "${payload}" \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])'
+      )"
+      echo "Published version ${ALP_VERSION} (id=${version_id})"
+
+      # 2. Upload artifact files (e.g. SBOMs) and attach them to the version.
+      upload_url="${api_url}/api/v1/projects/${ALP_PROJECT_ID}/versions/${version_id}/artifacts/upload/"
+      upload_artifact() {
+        local artifact_file="$1"
+        curl -fsS -X POST "${upload_url}" \
+          -H "Authorization: Bearer ${ALP_TOKEN}" \
+          -F "kind=${ALP_ARTIFACT_KIND}" \
+          -F "label=${ALP_ARTIFACT_LABEL}" \
+          -F "file=@${artifact_file}" >/dev/null
+        echo "Uploaded ${ALP_ARTIFACT_KIND} artifact ${artifact_file}"
+      }
+
+      shopt -s nullglob
+      [[ -n "${ALP_ARTIFACT_FILE}" ]] && upload_artifact "${ALP_ARTIFACT_FILE}"
+      while IFS= read -r pattern; do
+        [[ -n "${pattern}" ]] || continue
+        matches=( ${pattern} )
+        if [[ "${#matches[@]}" -eq 0 ]]; then
+          echo "##vso[task.logissue type=warning]No artifact files matched '${pattern}'"
+          continue
+        fi
+        for artifact_file in "${matches[@]}"; do
+          upload_artifact "${artifact_file}"
+        done
+      done <<< "${ALP_ARTIFACT_FILES}"
+    displayName: Publish Alpamayo version
+    env:
+      ALP_API_URL: ${{ parameters.apiUrl }}
+      ALP_TOKEN: ${{ parameters.token }}
+      ALP_PROJECT_ID: ${{ parameters.projectId }}
+      ALP_FEED: ${{ parameters.feed }}
+      ALP_VERSION: ${{ parameters.version }}
+      ALP_ORIGIN_EXTERNAL_ID: ${{ parameters.originExternalId }}
+      ALP_SOURCE_KIND: ${{ parameters.sourceKind }}
+      ALP_EXTERNAL_REF: ${{ parameters.externalRef }}
+      ALP_COMMIT_SHA: ${{ parameters.commitSha }}
+      ALP_OBJECT_KEY: ${{ parameters.objectKey }}
+      ALP_ARTIFACT_KIND: ${{ parameters.artifactKind }}
+      ALP_ARTIFACT_FILE: ${{ parameters.artifactFile }}
+      ALP_ARTIFACT_FILES: ${{ parameters.artifactFiles }}
+      ALP_ARTIFACT_LABEL: ${{ parameters.artifactLabel }}
